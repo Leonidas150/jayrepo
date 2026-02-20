@@ -1,176 +1,235 @@
 #!/usr/bin/env bash
+set -e
 
-# =============================================================================
-# WP High-Perf Installer FINAL v1.0 – Ubuntu 22.04 Optimized (1GB RAM Ready)
-# Target: Ubuntu 22.04 LTS | 1 Core / 1 GB RAM | Elementor-friendly
-# No placeholder, no syntax error, production-ready
-# =============================================================================
+BASE="/opt/ols-manager"
+SITES="$BASE/sites.db"
+BACKUP="$BASE/backups"
+OLS="/usr/local/lsws"
+WWW="/var/www"
 
-set -euo pipefail
-IFS=$'\n\t'
+mkdir -p $BASE $BACKUP
+touch $SITES
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-LOGFILE="/var/log/wp-install-final.log"
-[[ ! -w /var/log ]] && LOGFILE="/tmp/wp-install-final.log"
-exec > >(tee -a "$LOGFILE") 2>&1
-
-# Global variables
-DOMAIN=""
-SITE_TITLE=""
-ADMIN_USER=""
-ADMIN_PASS=""
-ADMIN_EMAIL=""
-DB_NAME=""
-DB_USER=""
-DB_PASS=""
-WEBROOT="/var/www"
-DRY_RUN=true
-INSTALL_DIR=""
-BACKUP_DIR="/backups"
-SWAP_SIZE="1G"
-
+#####################################
+header(){
 clear
-echo -e "\( {BLUE}WP High-Perf Installer FINAL v1.0 – Ubuntu 22.04 \){NC}"
-echo "Log: $LOGFILE | Dry-run: \( DRY_RUN | RAM: ~ \)(free -g | awk '/^Mem:/{print $2}')GB"
+echo "======================================"
+echo " OLS ENTERPRISE SERVER MANAGER"
+echo "======================================"
+}
+
+pause(){ read -p "Enter..."; }
+
+run(){
+ echo "[EXEC] $*"
+ eval "$*"
+}
+
+#####################################
+register_site(){
+read -p "Domain: " domain
+read -p "Path (example /var/www/site): " path
+echo "$domain|$path" >> $SITES
+echo "Registered."
+pause
+}
+
+#####################################
+list_sites(){
+echo "=== Registered Sites ==="
+nl -w2 -s') ' $SITES || true
+pause
+}
+
+#####################################
+install_site(){
+
+read -p "Domain: " domain
+read -p "DB Name: " db
+read -p "DB User: " dbu
+read -s -p "DB Pass: " dbp; echo
+
+path="$WWW/$domain"
+
+run "mkdir -p $path"
+run "cd $WWW && wget https://wordpress.org/latest.tar.gz"
+run "tar xf $WWW/latest.tar.gz"
+run "mv $WWW/wordpress/* $path"
+run "rm -rf $WWW/wordpress $WWW/latest.tar.gz"
+
+run "mysql -e \"CREATE DATABASE $db\""
+run "mysql -e \"CREATE USER '$dbu'@'localhost' IDENTIFIED BY '$dbp'\""
+run "mysql -e \"GRANT ALL ON $db.* TO '$dbu'@'localhost'\""
+
+run "cp $path/wp-config-sample.php $path/wp-config.php"
+run "sed -i 's/database_name_here/$db/' $path/wp-config.php"
+run "sed -i 's/username_here/$dbu/' $path/wp-config.php"
+run "sed -i 's/password_here/$dbp/' $path/wp-config.php"
+
+echo "$domain|$path" >> $SITES
+echo "Site installed + registered."
+pause
+}
+
+#####################################
+backup_site(){
+
+nl $SITES
+read -p "Select site number: " n
+line=$(sed -n "${n}p" $SITES)
+
+domain=$(echo $line|cut -d\| -f1)
+path=$(echo $line|cut -d\| -f2)
+
+run "mkdir -p $BACKUP/$domain"
+run "tar czf $BACKUP/$domain/files.tar.gz $path"
+run "mysqldump --all-databases > $BACKUP/$domain/db.sql"
+
+echo "Backup saved → $BACKUP/$domain"
+pause
+}
+
+#####################################
+restore_site(){
+
+read -p "Backup folder path: " src
+read -p "Restore path: " dest
+
+run "tar xzf $src/files.tar.gz -C /"
+run "mysql < $src/db.sql"
+
+echo "Restore done."
+pause
+}
+
+#####################################
+bulk_update_wp(){
+while read line; do
+path=$(echo $line|cut -d\| -f2)
+run "cd $path && wp core update --allow-root || true"
+done < $SITES
+pause
+}
+
+#####################################
+ssl_all(){
+
+while read line; do
+domain=$(echo $line|cut -d\| -f1)
+run "certbot certonly --standalone -d $domain --non-interactive --agree-tos -m admin@$domain || true"
+done < $SITES
+
+pause
+}
+
+#####################################
+system_audit(){
+
+echo "===== SYSTEM AUDIT ====="
+echo "CPU:"; lscpu | grep "Model name"
 echo
+echo "RAM:"; free -h
+echo
+echo "Disk:"; df -h
+echo
+echo "Top Load:"; uptime
+echo
+echo "OLS Status:"; systemctl status lsws --no-pager
+echo
+echo "MariaDB:"; systemctl status mariadb --no-pager
 
-# Lockfile
-LOCKFILE="/tmp/wp-install-final.lock"
-if [[ -f "$LOCKFILE" ]]; then
-    echo -e "${RED}Installer sedang berjalan atau crash sebelumnya. Hapus \( LOCKFILE. \){NC}"
-    exit 1
+pause
+}
+
+#####################################
+php_switch(){
+
+apt search lsphp | grep lsphp
+read -p "Install version: " v
+
+run "apt install -y $v"
+run "ln -sf $OLS/$v/bin/php /usr/bin/php"
+run "$OLS/bin/lswsctrl restart"
+
+pause
+}
+
+#####################################
+snapshot(){
+
+snap="$BACKUP/full_snapshot_$(date +%s)"
+mkdir -p $snap
+
+run "tar czf $snap/ols.tar.gz $OLS"
+run "tar czf $snap/www.tar.gz $WWW"
+run "mysqldump --all-databases > $snap/db.sql"
+
+echo "Snapshot ready → $snap"
+pause
+}
+
+#####################################
+cron_maintenance(){
+
+echo "Setting auto maintenance..."
+
+(crontab -l 2>/dev/null; echo "0 3 * * * $0 --auto-update") | crontab -
+
+echo "Daily maintenance enabled."
+pause
+}
+
+#####################################
+auto_update(){
+
+while read line; do
+path=$(echo $line|cut -d\| -f2)
+cd $path
+wp core update --allow-root || true
+wp plugin update --all --allow-root || true
+wp theme update --all --allow-root || true
+done < $SITES
+
+}
+
+#####################################
+if [[ "${1:-}" == "--auto-update" ]]; then
+auto_update
+exit
 fi
-touch "$LOCKFILE"
-trap 'rm -f "$LOCKFILE"' EXIT
-trap 'echo -e "${RED}Error di baris \( LINENO \){NC}"; rm -f "$LOCKFILE"; exit 1' ERR
 
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "\( {RED}Script harus dijalankan dengan sudo/root \){NC}"
-        exit 1
-    fi
-}
+#####################################
+MENU
+#####################################
+while true; do
+header
+echo "1) Install Site"
+echo "2) Register Existing Site"
+echo "3) List Sites"
+echo "4) Backup Site"
+echo "5) Restore Site"
+echo "6) Bulk Update WP"
+echo "7) Issue SSL All Sites"
+echo "8) PHP Switch"
+echo "9) System Audit"
+echo "10) Full Snapshot"
+echo "11) Enable Auto Maintenance"
+echo "0) Exit"
 
-run_cmd() {
-    echo "[EXEC] $*"
-    if ! $DRY_RUN; then
-        "$@"
-    fi
-}
+read -p "Select: " c
 
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-n}"
-    local yn
-    if [[ "\( default" =~ ^[Yy] \) ]]; then
-        prompt="$prompt [Y/n]: "
-    else
-        prompt="$prompt [y/N]: "
-    fi
-    while true; do
-        read -r -p "$prompt" yn
-        case "$yn" in
-            [Yy]*) return 0 ;;
-            [Nn]*) return 1 ;;
-            "") [[ "\( default" =~ ^[Yy] \) ]] && return 0 || return 1 ;;
-            *) echo "Masukkan y atau n saja." ;;
-        esac
-    done
-}
-
-input_required() {
-    local varname="$1"
-    local prompt="$2"
-    local value
-    while [[ -z "${!varname:-}" ]]; do
-        read -r -p "$prompt: " value
-        [[ -z "\( value" ]] && echo -e " \){RED}Wajib diisi!${NC}" || printf -v "$varname" '%s' "$value"
-    done
-}
-
-validate_domain() {
-    if [[ ! "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]]; then
-        echo -e "\( {RED}Domain tidak valid (contoh: contoh.com) \){NC}"
-        return 1
-    fi
-    return 0
-}
-
-add_swap() {
-    echo -e "${GREEN}→ Tambah swap \( SWAP_SIZE (safety net OOM) \){NC}"
-    run_cmd fallocate -l "$SWAP_SIZE" /swapfile
-    run_cmd chmod 600 /swapfile
-    run_cmd mkswap /swapfile
-    run_cmd swapon /swapfile
-    echo '/swapfile none swap sw 0 0' | run_cmd tee -a /etc/fstab
-}
-
-wizard_collect_data() {
-    echo -e "\( {YELLOW}=== Input Data === \){NC}"
-    while true; do
-        input_required DOMAIN "Domain (contoh: contoh.com)"
-        validate_domain "$DOMAIN" && break
-    done
-    input_required LE_EMAIL "Email Let's Encrypt"
-    input_required SITE_TITLE "Judul Website"
-    input_required ADMIN_USER "Username Admin"
-    read -r -s -p "Password Admin (akan dipakai juga untuk DB root sementara): " ADMIN_PASS; echo
-    input_required ADMIN_EMAIL "Email Admin"
-    input_required DB_NAME "Nama Database"
-    input_required DB_USER "User Database"
-    read -r -s -p "Password Database: " DB_PASS; echo
-
-    INSTALL_DIR="$WEBROOT/$DOMAIN"
-    echo -e "\n\( {BLUE}Ringkasan: \){NC}"
-    printf "%-15s : %s\n" "Domain" "$DOMAIN" "Path" "$INSTALL_DIR" "DB Name" "$DB_NAME" "DB User" "$DB_USER"
-    ask_yes_no "Lanjut instalasi?" "y" || exit 0
-}
-
-# ... (fungsi install_system_update, tune_php_fpm, tune_nginx, create_vhost, install_mariadb_secure, create_database, install_redis, tune_redis, install_wp_cli, install_wordpress, setup_redis_cache, install_certbot_ssl, setup_permissions, setup_ufw, setup_fail2ban, setup_backup_cron, setup_nginx_watchdog tetap sama seperti versi sebelumnya, tanpa escape salah)
-
-install_full_stack() {
-    add_swap
-    install_system_update
-    tune_nginx
-    tune_php_fpm
-    install_mariadb_secure
-    create_database
-    install_redis
-    tune_redis
-    install_wp_cli
-    install_wordpress
-    create_vhost
-    run_cmd nginx -t && run_cmd systemctl reload nginx
-    install_certbot_ssl
-    setup_permissions
-    setup_redis_cache
-    setup_ufw
-    setup_fail2ban
-    setup_backup_cron
-    setup_nginx_watchdog
-
-    echo -e "\( {GREEN}INSTALASI SELESAI! \){NC}"
-    echo "Akses: https://$DOMAIN"
-    echo "WP Admin: https://$DOMAIN/wp-admin"
-    echo "Backup: $BACKUP_DIR"
-    echo "Log: $LOGFILE"
-}
-
-# Arg parser
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --no-dry-run) DRY_RUN=false; shift ;;
-        *) echo "Arg tidak dikenal: $1"; exit 1 ;;
-    esac
+case $c in
+1) install_site ;;
+2) register_site ;;
+3) list_sites ;;
+4) backup_site ;;
+5) restore_site ;;
+6) bulk_update_wp ;;
+7) ssl_all ;;
+8) php_switch ;;
+9) system_audit ;;
+10) snapshot ;;
+11) cron_maintenance ;;
+0) exit ;;
+esac
 done
-
-check_root
-wizard_collect_data
-install_full_stack
-
-echo -e "${GREEN}Selesai. Selamat menggunakan! Jika ada error, cek \( LOGFILE. \){NC}"
