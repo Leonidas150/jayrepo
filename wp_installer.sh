@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-set -e
+
+set -euo pipefail
+IFS=$'\n\t'
 
 BASE="/opt/ols-manager"
 SITES="$BASE/sites.db"
@@ -10,7 +12,6 @@ WWW="/var/www"
 mkdir -p "$BASE" "$BACKUP"
 touch "$SITES"
 
-#####################################
 header() {
     clear
     echo "======================================"
@@ -24,173 +25,164 @@ pause() {
 
 run() {
     echo "[EXEC] $*"
-    eval "$*"
+    "$@"
 }
 
-#####################################
 register_site() {
     read -rp "Domain: " domain
     read -rp "Path (ex: /var/www/site): " path
-    echo "${domain}|${path}" >> "$SITES"
+    echo "\( {domain}| \){path}" >> "$SITES"
     echo "Registered."
     pause
 }
 
-#####################################
 list_sites() {
     echo "=== Registered Sites ==="
     nl -w2 -s') ' "$SITES" || true
     pause
 }
 
-#####################################
 install_site() {
     read -rp "Domain: " domain
     read -rp "DB Name: " db
     read -rp "DB User: " dbu
-    read -rsp "DB Pass: " dbp
-    echo
+    read -rsp "DB Pass: " dbp; echo
 
     path="$WWW/$domain"
 
-    run "mkdir -p \"$path\""
-    run "cd \"$WWW\" && wget https://wordpress.org/latest.tar.gz"
-    run "tar xf \"$WWW/latest.tar.gz\""
-    run "mv \"$WWW/wordpress\"/* \"$path\""
-    run "rm -rf \"$WWW/wordpress\" \"$WWW/latest.tar.gz\""
+    run mkdir -p "$path"
+    run chown www-data:www-data "$path"
 
-    run "mysql -e \"CREATE DATABASE $db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\""
-    run "mysql -e \"CREATE USER '$dbu'@'localhost' IDENTIFIED BY '$dbp';\""
-    run "mysql -e \"GRANT ALL PRIVILEGES ON $db.* TO '$dbu'@'localhost'; FLUSH PRIVILEGES;\""
+    # Download & extract WP
+    cd "$WWW"
+    run wget https://wordpress.org/latest.tar.gz
+    run tar xf latest.tar.gz
+    run mv wordpress/* "$path"/
+    run rm -rf wordpress latest.tar.gz
 
-    run "cp \"$path/wp-config-sample.php\" \"$path/wp-config.php\""
-    run "sed -i 's/database_name_here/$db/' \"$path/wp-config.php\""
-    run "sed -i 's/username_here/$dbu/' \"$path/wp-config.php\""
-    run "sed -i 's/password_here/$dbp/' \"$path/wp-config.php\""
+    # DB setup (asumsi root pakai socket, kalau pakai password ganti ke -p"$PASS")
+    run mysql -e "CREATE DATABASE IF NOT EXISTS $db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+    run mysql -e "CREATE USER IF NOT EXISTS '$dbu'@'localhost' IDENTIFIED BY '$dbp';"
+    run mysql -e "GRANT ALL PRIVILEGES ON $db.* TO '$dbu'@'localhost'; FLUSH PRIVILEGES;"
 
-    echo "${domain}|${path}" >> "$SITES"
+    # wp-config
+    run cp "$path/wp-config-sample.php" "$path/wp-config.php"
+    run sed -i "s/database_name_here/$db/" "$path/wp-config.php"
+    run sed -i "s/username_here/$dbu/" "$path/wp-config.php"
+    run sed -i "s/password_here/$dbp/" "$path/wp-config.php"
+
+    echo "\( {domain}| \){path}" >> "$SITES"
     echo "Site installed + registered."
     pause
 }
 
-#####################################
 backup_site() {
     nl "$SITES"
     read -rp "Select site number: " n
-    line=$(sed -n "${n}p" "$SITES")
+    line=\( (sed -n " \){n}p" "$SITES")
 
-    domain=$(echo "$line" | cut -d\| -f1)
-    path=$(echo "$line" | cut -d\| -f2)
+    domain=$(echo "$line" | cut -d'|' -f1)
+    path=$(echo "$line" | cut -d'|' -f2)
 
-    run "mkdir -p \"$BACKUP/$domain\""
-    run "tar czf \"$BACKUP/$domain/files.tar.gz\" \"$path\""
-    run "mysqldump --all-databases > \"$BACKUP/$domain/db.sql\""
+    backup_dir="$BACKUP/\( domain/ \)(date +%Y-%m-%d)"
+    run mkdir -p "$backup_dir"
 
-    echo "Backup saved → $BACKUP/$domain"
+    run tar czf "$backup_dir/files.tar.gz" -C "$WWW" "$domain"
+    run mysqldump -u root "$db" > "$backup_dir/db.sql"  # Ganti $db kalau perlu
+
+    echo "Backup saved → $backup_dir"
     pause
 }
 
-#####################################
 restore_site() {
-    read -rp "Backup folder path: " src
+    read -rp "Backup folder path (ex: /opt/ols-manager/backups/domain/2025-02-20): " src
     read -rp "Restore to path: " dest
 
-    run "tar xzf \"$src/files.tar.gz\" -C /"
-    run "mysql < \"$src/db.sql\""
+    run mkdir -p "$dest"
+    run tar xzf "$src/files.tar.gz" -C "$dest"
+    run mysql -u root < "$src/db.sql"
 
-    echo "Restore done."
+    echo "Restore done. Edit wp-config.php kalau DB/user/pass berubah."
     pause
 }
 
-#####################################
 bulk_update_wp() {
     while IFS= read -r line; do
-        path=$(echo "$line" | cut -d\| -f2)
-        run "cd \"$path\" && wp core update --allow-root || true"
+        path=$(echo "$line" | cut -d'|' -f2)
+        if [[ -d "$path" ]]; then
+            run cd "$path"
+            run wp core update --allow-root || true
+            run wp plugin update --all --allow-root || true
+            run wp theme update --all --allow-root || true
+        fi
     done < "$SITES"
     pause
 }
 
-#####################################
 ssl_all() {
     while IFS= read -r line; do
-        domain=$(echo "$line" | cut -d\| -f1)
-        run "certbot certonly --standalone -d \"$domain\" --non-interactive --agree-tos -m admin@\"$domain\" || true"
+        domain=$(echo "$line" | cut -d'|' -f1)
+        path=$(echo "$line" | cut -d'|' -f2)
+        run certbot certonly --webroot -w "$path" -d "$domain" --non-interactive --agree-tos -m "admin@$domain" || true
     done < "$SITES"
     pause
 }
 
-#####################################
 system_audit() {
     echo "===== SYSTEM AUDIT ====="
     echo "CPU:"; lscpu | grep "Model name"
-    echo
     echo "RAM:"; free -h
-    echo
     echo "Disk:"; df -h
-    echo
     echo "Load:"; uptime
-    echo
-    echo "OLS Status:"; systemctl status lsws --no-pager
-    echo
-    echo "MariaDB:"; systemctl status mariadb --no-pager
+    echo "OLS Status:"; /usr/local/lsws/bin/lswsctrl status
     pause
 }
 
-#####################################
 php_switch() {
     apt search lsphp | grep lsphp
-    read -rp "Install version: " v
-
-    run "apt install -y \"$v\""
-    run "ln -sf \"$OLS/$v/bin/php\" /usr/bin/php"
+    read -rp "Install version (ex: lsphp83): " v
+    run apt install -y "$v"
+    run ln -sf "$OLS/$v/bin/php" /usr/bin/php
     run "$OLS/bin/lswsctrl restart"
     pause
 }
 
-#####################################
 snapshot() {
-    snap="$BACKUP/full_snapshot_$(date +%s)"
-    mkdir -p "$snap"
-
-    run "tar czf \"$snap/ols.tar.gz\" \"$OLS\""
-    run "tar czf \"$snap/www.tar.gz\" \"$WWW\""
-    run "mysqldump --all-databases > \"$snap/db.sql\""
-
+    snap="\( BACKUP/full_snapshot_ \)(date +%s)"
+    run mkdir -p "$snap"
+    run tar czf "$snap/ols.tar.gz" "$OLS"
+    run tar czf "$snap/www.tar.gz" "$WWW"
+    run mysqldump -u root --all-databases > "$snap/db.sql"
     echo "Snapshot ready → $snap"
     pause
 }
 
-#####################################
 cron_maintenance() {
     echo "Enabling auto maintenance..."
-
     (crontab -l 2>/dev/null; echo "0 3 * * * $0 --auto-update") | crontab -
-
     echo "Daily maintenance enabled."
     pause
 }
 
-#####################################
 auto_update() {
     while IFS= read -r line; do
-        path=$(echo "$line" | cut -d\| -f2)
-        cd "$path"
-        wp core update --allow-root || true
-        wp plugin update --all --allow-root || true
-        wp theme update --all --allow-root || true
+        path=$(echo "$line" | cut -d'|' -f2)
+        if [[ -d "$path" ]]; then
+            cd "$path"
+            wp core update --allow-root || true
+            wp plugin update --all --allow-root || true
+            wp theme update --all --allow-root || true
+        fi
     done < "$SITES"
 }
 
-#####################################
+# Auto-update mode (untuk cron)
 if [[ "${1:-}" == "--auto-update" ]]; then
     auto_update
-    exit
+    exit 0
 fi
 
-#####################################
-# MENU LOOP
-#####################################
+# Main menu loop
 while true; do
     header
     echo "1) Install Site"
@@ -221,7 +213,7 @@ while true; do
         9) system_audit ;;
         10) snapshot ;;
         11) cron_maintenance ;;
-        0) exit ;;
-        *) echo "Invalid"; sleep 1 ;;
+        0) exit 0 ;;
+        *) echo "Invalid choice"; sleep 1 ;;
     esac
 done
